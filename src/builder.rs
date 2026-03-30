@@ -9,7 +9,7 @@ use crate::scanner;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::{Cursor, copy};
@@ -264,6 +264,8 @@ fn apply_external_export_defaults(dep: &mut ResolvedDependency, profile: BuildPr
         return;
     };
 
+    let inferred_pkg_config = infer_pkg_config_link_metadata(dep);
+
     if dep.exports.include_dirs.is_empty() {
         push_unique(&mut dep.exports.include_dirs, format!("{}/include", dep.root_dir));
         if matches!(build_system, ExternalBuildSystem::Make) {
@@ -288,14 +290,190 @@ fn apply_external_export_defaults(dep: &mut ResolvedDependency, profile: BuildPr
         }
     }
 
+    if let Some(metadata) = &inferred_pkg_config {
+        for dir in &metadata.lib_dirs {
+            push_unique(&mut dep.exports.lib_dirs, dir.clone());
+        }
+    }
+
     if dep.exports.libs.is_empty() {
         dep.exports.libs.push(dep.name.clone());
+    }
+
+    if let Some(metadata) = inferred_pkg_config {
+        for lib in metadata.libs {
+            push_unique(&mut dep.exports.libs, lib);
+        }
+    }
+
+    // Some static libraries (notably raylib on Windows/MinGW) may omit
+    // required system libs in pkg-config output; keep link stable by adding
+    // well-known platform runtime libs.
+    if cfg!(windows) && dep.name.eq_ignore_ascii_case("raylib") {
+        push_unique(&mut dep.exports.libs, "winmm".to_string());
+        push_unique(&mut dep.exports.libs, "gdi32".to_string());
+        push_unique(&mut dep.exports.libs, "opengl32".to_string());
     }
 }
 
 fn push_unique(target: &mut Vec<String>, value: String) {
     if !target.iter().any(|existing| existing == &value) {
         target.push(value);
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct PkgConfigLinkMetadata {
+    lib_dirs: Vec<String>,
+    libs: Vec<String>,
+}
+
+fn infer_pkg_config_link_metadata(dep: &ResolvedDependency) -> Option<PkgConfigLinkMetadata> {
+    let pkgconfig_dir = Path::new(&dep.root_dir).join("lib").join("pkgconfig");
+    if !pkgconfig_dir.exists() {
+        return None;
+    }
+
+    let preferred = pkgconfig_dir.join(format!("{}.pc", dep.name));
+    let pc_path = if preferred.exists() {
+        preferred
+    } else {
+        fs::read_dir(&pkgconfig_dir)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("pc"))
+                    .unwrap_or(false)
+            })?
+    };
+
+    let content = fs::read_to_string(&pc_path).ok()?;
+    Some(parse_pkg_config_link_metadata(&content))
+}
+
+fn parse_pkg_config_link_metadata(content: &str) -> PkgConfigLinkMetadata {
+    let mut metadata = PkgConfigLinkMetadata::default();
+    let mut variables = HashMap::<String, String>::new();
+    let mut libs_sections = Vec::<String>::new();
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            if !key.is_empty()
+                && !key.contains(' ')
+                && !key.contains('\t')
+                && !key.contains(':')
+            {
+                variables.insert(key.to_string(), value.trim().to_string());
+                continue;
+            }
+        }
+
+        if let Some(value) = line.strip_prefix("Libs:") {
+            libs_sections.push(value.trim().to_string());
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("Libs.private:") {
+            libs_sections.push(value.trim().to_string());
+        }
+    }
+
+    for section in libs_sections {
+        let expanded = expand_pkg_config_value(&section, &variables, 0);
+        let mut tokens = expanded
+            .split_whitespace()
+            .map(|token| token.trim_matches('"').trim_matches('\'').to_string())
+            .peekable();
+
+        while let Some(token) = tokens.next() {
+            if token.is_empty() {
+                continue;
+            }
+
+            if token == "-L" {
+                if let Some(dir) = tokens.next() {
+                    let clean_dir = dir.trim_matches('"').trim_matches('\'');
+                    if !clean_dir.is_empty() {
+                        let normalized = normalize_path(Path::new(clean_dir));
+                        push_unique(&mut metadata.lib_dirs, normalized);
+                    }
+                }
+                continue;
+            }
+
+            if token == "-l" {
+                if let Some(lib) = tokens.next() {
+                    let clean_lib = lib.trim_matches('"').trim_matches('\'');
+                    if !clean_lib.is_empty() {
+                        push_unique(&mut metadata.libs, clean_lib.to_string());
+                    }
+                }
+                continue;
+            }
+
+            if let Some(dir) = token.strip_prefix("-L") {
+                let clean_dir = dir.trim_matches('"').trim_matches('\'');
+                if !clean_dir.is_empty() {
+                    let normalized = normalize_path(Path::new(clean_dir));
+                    push_unique(&mut metadata.lib_dirs, normalized);
+                }
+                continue;
+            }
+
+            if let Some(lib) = token.strip_prefix("-l") {
+                let clean_lib = lib.trim_matches('"').trim_matches('\'');
+                if !clean_lib.is_empty() {
+                    push_unique(&mut metadata.libs, clean_lib.to_string());
+                }
+                continue;
+            }
+
+            if token.starts_with('-') || token.contains('/') || token.contains('\\') {
+                push_unique(&mut metadata.libs, token);
+            }
+        }
+    }
+
+    metadata
+}
+
+fn expand_pkg_config_value(value: &str, vars: &HashMap<String, String>, depth: usize) -> String {
+    if depth >= 8 {
+        return value.to_string();
+    }
+
+    let mut expanded = value.to_string();
+    let mut changed = false;
+
+    loop {
+        let Some(start) = expanded.find("${") else {
+            break;
+        };
+        let Some(end_rel) = expanded[start + 2..].find('}') else {
+            break;
+        };
+        let end = start + 2 + end_rel;
+        let key = &expanded[start + 2..end];
+        let replacement = vars
+            .get(key)
+            .map(|candidate| expand_pkg_config_value(candidate, vars, depth + 1))
+            .unwrap_or_default();
+        expanded.replace_range(start..=end, &replacement);
+        changed = true;
+    }
+
+    if changed {
+        expand_pkg_config_value(&expanded, vars, depth + 1)
+    } else {
+        expanded
     }
 }
 

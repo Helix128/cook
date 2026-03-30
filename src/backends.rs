@@ -277,7 +277,7 @@ impl BuildBackend for MakeBackend {
             };
 
             compile_rules.push(format!(
-                "{object}: {src}\n\t@mkdir -p $(dir $@)\n\t{compiler} {flags} $(INCLUDES) -c $< -o $@"
+                "{object}: {src}\n\t@$(call MKDIR_P,$(dir $@))\n\t{compiler} {flags} $(INCLUDES) -c $< -o $@"
             ));
         }
 
@@ -307,7 +307,34 @@ impl BuildBackend for MakeBackend {
         };
 
         Ok(format!(
-            "CC ?= gcc\nCXX ?= g++\nCFLAGS ?= {}\nCXXFLAGS ?= {}\nINCLUDES := {}\nDEP_LINKS := {}\nOUTPUT := {}/{}\nOBJECTS := {}\n\nall: $(OUTPUT)\n\n$(OUTPUT): $(OBJECTS)\n\t@mkdir -p $(dir $@)\n\t$(CXX) $(OBJECTS) $(DEP_LINKS) -o $@\n\n{}\n\nclean:\n\trm -rf {}\n",
+            r#"CC ?= gcc
+CXX ?= g++
+CFLAGS ?= {}
+CXXFLAGS ?= {}
+INCLUDES := {}
+DEP_LINKS := {}
+OUTPUT := {}/{}
+OBJECTS := {}
+
+ifeq ($(OS),Windows_NT)
+MKDIR_P = if not exist "$(subst /,\,$(patsubst %/,%,$(1)))" mkdir "$(subst /,\,$(patsubst %/,%,$(1)))"
+RM_RF = if exist "$(subst /,\,$(patsubst %/,%,$(1)))" rmdir /S /Q "$(subst /,\,$(patsubst %/,%,$(1)))"
+else
+MKDIR_P = mkdir -p "$(1)"
+RM_RF = rm -rf "$(1)"
+endif
+
+all: $(OUTPUT)
+
+$(OUTPUT): $(OBJECTS)
+	@$(call MKDIR_P,$(dir $@))
+	$(CXX) $(OBJECTS) $(DEP_LINKS) -o $@
+
+{}
+
+clean:
+	@$(call RM_RF,{})
+"#,
             c_flags,
             cxx_flags,
             include_flags,

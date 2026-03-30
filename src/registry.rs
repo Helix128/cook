@@ -9,7 +9,7 @@ use std::env;
 use std::time::Duration;
 
 const DEFAULT_COOKBOOK_RAW_BASE_URL: &str =
-	"https://github.com/Helix128/cookbook/blob/main/packages";
+	"https://github.com/Helix128/cookbook/tree/main/packages";
 
 #[derive(Debug, Clone)]
 pub struct RegistryResolution {
