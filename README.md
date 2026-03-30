@@ -27,4 +27,4 @@ cook run
 ```
 
 ## cookbook
-the [cookbook](https://github.com/Helix128/cookbook) is cook's package registry, it is a simple git repository that contains a collection of recipes. each recipe is a directory that contains a `.toml` file that describes the package and where to download it from.
+the [cookbook](https://github.com/Helix128/cookbook) is cook's package registry, it is a simple git repository that contains a collection of recipes. each "recipe" is a `.toml` file that describes the package and where to download it from.
