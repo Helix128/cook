@@ -28,6 +28,9 @@ cook build
 # OR (release profile)
 cook build -r
 
+# clean build artifacts
+cook clean
+
 # run the project
 cook run
 ```

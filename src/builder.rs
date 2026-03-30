@@ -210,6 +210,19 @@ pub fn lock_project() -> Result<()> {
     Ok(())
 }
 
+pub fn clean_project() -> Result<()> {
+    let target_dir = Path::new("target");
+    if !target_dir.exists() {
+        println!("cook: nothing to clean (target/ does not exist)");
+        return Ok(());
+    }
+
+    fs::remove_dir_all(target_dir)
+        .with_context(|| format!("failed to remove {}", target_dir.display()))?;
+    println!("cook: removed build artifacts at target/");
+    Ok(())
+}
+
 fn run_commands(steps: Vec<CommandSpec>) -> Result<()> {
     for step in steps {
         let status = Command::new(&step.program)

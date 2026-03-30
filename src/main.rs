@@ -23,6 +23,7 @@ struct Cli {
 enum Commands {
     New { name: String },
     Build,
+    Clean,
     Lock,
     Add {
         name: String,
@@ -43,6 +44,11 @@ fn main() {
         }
         Some(Commands::Build) | None => {
             if let Err(e) = builder::build_project(cli.release) {
+                eprintln!("{} {}", "FAILED:".red(), e);
+            }
+        }
+        Some(Commands::Clean) => {
+            if let Err(e) = builder::clean_project() {
                 eprintln!("{} {}", "FAILED:".red(), e);
             }
         }
