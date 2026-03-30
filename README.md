@@ -16,8 +16,10 @@ cd my_project
 cook add raylib
 
 # build the project
+cook 
+# OR
 cook build
-# release build
+# OR (release profile)
 cook build -r
 
 # run the project
