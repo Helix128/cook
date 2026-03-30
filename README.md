@@ -13,7 +13,13 @@ cook new my_project
 
 # add a dependency
 cd my_project
+
+
+# add from registry
 cook add raylib
+
+# or add from a repo directly
+cook add raylib https://github.com/raysan5/raylib.git
 
 # build the project
 cook 
