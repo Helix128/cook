@@ -3,6 +3,7 @@ use crate::config::BuildBackend as BuildBackendKind;
 use crate::config::{BuildCompiler, CookConfig, DependencyDetail, DependencySpec};
 use crate::backends::{BuildBackend, BuildPlan, BuildProfile, CmakeBackend, CommandSpec, MakeBackend};
 use crate::lockfile::CookLock;
+use crate::reporter::Reporter;
 use crate::registry;
 use crate::resolver::{self, ExternalBuildSystem, ResolveOptions, ResolvedDependency};
 use crate::scanner;
@@ -12,18 +13,19 @@ use reqwest::StatusCode;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
-use std::io::{Cursor, copy};
+use std::io::{Cursor, Read, copy};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use zip::ZipArchive;
 
-pub fn build_project(release: bool) -> Result<PathBuf> {
-    build_project_with_profile(profile_from_release(release))
+pub fn build_project(release: bool, reporter: &Reporter) -> Result<PathBuf> {
+    build_project_with_profile(profile_from_release(release), reporter)
 }
 
-pub fn run_project(release: bool) -> Result<()> {
-    let artifact = build_project(release)?;
+pub fn run_project(release: bool, reporter: &Reporter) -> Result<()> {
+    let artifact = build_project(release, reporter)?;
+    reporter.info(format!("Running binary {}", artifact.display()));
     let status = Command::new(&artifact)
         .status()
         .with_context(|| format!("failed to execute {}", artifact.display()))?;
@@ -35,7 +37,7 @@ pub fn run_project(release: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn add_dependency(name: &str, url: Option<&str>) -> Result<()> {
+pub fn add_dependency(name: &str, url: Option<&str>, reporter: &Reporter) -> Result<()> {
     if name.trim().is_empty() {
         bail!("dependency name cannot be empty");
     }
@@ -55,12 +57,23 @@ pub fn add_dependency(name: &str, url: Option<&str>) -> Result<()> {
             ..DependencyDetail::default()
         }
     } else {
-        let resolved = registry::resolve_package_from_cookbook(name)?;
-        println!(
-            "cook: package '{}' resolved from cookbook as '{}'",
-            name,
+        let spinner = reporter.spinner(format!("Resolving '{name}' from cookbook..."));
+        let resolved = registry::resolve_package_from_cookbook(name);
+        match (&spinner, &resolved) {
+            (Some(pb), Ok(data)) => {
+                pb.finish_with_message(format!(
+                    "Resolved '{}' from cookbook as '{}'",
+                    name, data.dependency_name
+                ));
+            }
+            (Some(pb), Err(_)) => pb.finish_and_clear(),
+            _ => {}
+        }
+        let resolved = resolved?;
+        reporter.info(format!(
+            "Package '{name}' resolved from cookbook as '{}'",
             resolved.dependency_name
-        );
+        ));
         resolved.detail
     };
 
@@ -74,19 +87,26 @@ pub fn add_dependency(name: &str, url: Option<&str>) -> Result<()> {
         let rev = if let Some(rev) = detail.rev.clone() {
             rev
         } else {
-            resolve_remote_head_rev(&source_url)?
+            let spinner = reporter.spinner("Resolving remote HEAD revision...");
+            let resolved = resolve_remote_head_rev(&source_url);
+            match (&spinner, &resolved) {
+                (Some(pb), Ok(_)) => pb.finish_with_message("Resolved remote HEAD revision"),
+                (Some(pb), Err(_)) => pb.finish_and_clear(),
+                _ => {}
+            }
+            resolved?
         };
         detail.rev = Some(rev.clone());
-        format!("cook: dependency '{name}' added at rev {rev}")
+        format!("Dependency '{name}' added at pinned revision {rev}")
     } else {
-        let local_dep_path = materialize_archive_dependency(name, &source_url)?;
+        let local_dep_path = materialize_archive_dependency(name, &source_url, reporter)?;
         detail.path = Some(local_dep_path);
         detail.git = None;
         detail.rev = None;
         detail.branch = None;
         detail.tag = None;
         format!(
-            "cook: dependency '{name}' added from archive source {}",
+            "Dependency '{name}' added from archive source {}",
             source_url
         )
     };
@@ -99,12 +119,12 @@ pub fn add_dependency(name: &str, url: Option<&str>) -> Result<()> {
     let rendered = toml::to_string_pretty(&config)
         .context("failed to serialize updated cook.toml")?;
     fs::write("cook.toml", rendered).context("failed to write cook.toml")?;
-    println!("{added_message}");
+    reporter.success(added_message);
 
     Ok(())
 }
 
-fn build_project_with_profile(profile: BuildProfile) -> Result<PathBuf> {
+fn build_project_with_profile(profile: BuildProfile, reporter: &Reporter) -> Result<PathBuf> {
     let config = load_config()?;
 
     fs::create_dir_all(".cook/deps")?;
@@ -120,16 +140,21 @@ fn build_project_with_profile(profile: BuildProfile) -> Result<PathBuf> {
         },
     )?;
     if !resolution.build_order.is_empty() {
-        println!(
-            "cook: resolved {} transitive package(s)",
+        reporter.info(format!(
+            "Resolved {} transitive package(s)",
             resolution.build_order.len()
-        );
+        ));
     }
     let lock = CookLock::from_resolution(&resolution);
     enforce_lock_policy(&config, &lock, Path::new("cook.lock"))?;
 
     let mut resolved_dependencies = resolution.direct_dependencies;
-    prepare_external_dependencies(&mut resolved_dependencies, profile, config.build.compiler)?;
+    prepare_external_dependencies(
+        &mut resolved_dependencies,
+        profile,
+        config.build.compiler,
+        reporter,
+    )?;
 
     let sources = scanner::discover_files("src")?;
     if sources.is_empty() {
@@ -170,14 +195,16 @@ fn build_project_with_profile(profile: BuildProfile) -> Result<PathBuf> {
         .map(PathBuf::from)
         .collect::<Vec<_>>();
     if cache::cache_hit(&cache_key_path, &cache_key, &artifacts)? {
-        println!("cook: build cache hit, artifact is up-to-date");
+        reporter.success("Build cache hit; artifact is up-to-date");
         if let Some(path) = first_existing_path(&artifacts) {
             return Ok(path);
         }
     }
 
-    run_commands(backend.configure_steps(&plan))?;
-    run_commands(backend.build_steps(&plan))?;
+    reporter.info("Configuring build backend...");
+    run_commands(backend.configure_steps(&plan), reporter)?;
+    reporter.info("Building project sources...");
+    run_commands(backend.build_steps(&plan), reporter)?;
     cache::write_cache_key(&cache_key_path, &cache_key)?;
 
     if let Some(path) = first_existing_path(&artifacts) {
@@ -191,7 +218,7 @@ fn build_project_with_profile(profile: BuildProfile) -> Result<PathBuf> {
     )
 }
 
-pub fn lock_project() -> Result<()> {
+pub fn lock_project(reporter: &Reporter) -> Result<()> {
     let config = load_config()?;
 
     fs::create_dir_all(".cook/deps")?;
@@ -206,25 +233,26 @@ pub fn lock_project() -> Result<()> {
 
     let lock = CookLock::from_resolution(&resolution);
     lock.write(Path::new("cook.lock"))?;
-    println!("cook: lockfile updated at cook.lock");
+    reporter.success("Lockfile updated at cook.lock");
     Ok(())
 }
 
-pub fn clean_project() -> Result<()> {
+pub fn clean_project(reporter: &Reporter) -> Result<()> {
     let target_dir = Path::new("target");
     if !target_dir.exists() {
-        println!("cook: nothing to clean (target/ does not exist)");
+        reporter.warn("Nothing to clean; target/ does not exist");
         return Ok(());
     }
 
     fs::remove_dir_all(target_dir)
         .with_context(|| format!("failed to remove {}", target_dir.display()))?;
-    println!("cook: removed build artifacts at target/");
+    reporter.success("Removed build artifacts at target/");
     Ok(())
 }
 
-fn run_commands(steps: Vec<CommandSpec>) -> Result<()> {
+fn run_commands(steps: Vec<CommandSpec>, reporter: &Reporter) -> Result<()> {
     for step in steps {
+        reporter.debug(format!("running command: {} {}", step.program, step.args.join(" ")));
         let status = Command::new(&step.program)
             .args(&step.args)
             .status()
@@ -242,21 +270,22 @@ fn prepare_external_dependencies(
     dependencies: &mut [ResolvedDependency],
     profile: BuildProfile,
     compiler: BuildCompiler,
+    reporter: &Reporter,
 ) -> Result<()> {
     for dep in dependencies {
         let Some(build_system) = dep.external_build_system else {
             continue;
         };
 
-        println!(
-            "cook: preparing external dependency '{}' using {}",
+        reporter.info(format!(
+            "Preparing external dependency '{}' using {}",
             dep.name,
             build_system.as_str()
-        );
+        ));
 
         let normalized_root = match build_system {
             ExternalBuildSystem::Cmake => {
-                let install_dir = build_external_cmake_dependency(dep, profile, compiler)?;
+                let install_dir = build_external_cmake_dependency(dep, profile, compiler, reporter)?;
                 normalize_path(&install_dir)
             }
             ExternalBuildSystem::Make => {
@@ -494,6 +523,7 @@ fn build_external_cmake_dependency(
     dep: &ResolvedDependency,
     profile: BuildProfile,
     compiler: BuildCompiler,
+    reporter: &Reporter,
 ) -> Result<PathBuf> {
     let dep_root = PathBuf::from(&dep.root_dir);
     let compiler_dir = match compiler {
@@ -559,7 +589,7 @@ fn build_external_cmake_dependency(
             program: "cmake".to_string(),
             args: cmake_install_args,
         },
-    ])?;
+    ], reporter)?;
 
     Ok(install_dir)
 }
@@ -639,7 +669,7 @@ fn enforce_lock_policy(config: &CookConfig, lock: &CookLock, lock_path: &Path) -
     Ok(())
 }
 
-pub fn new_project(name: &str) -> Result<()> {
+pub fn new_project(name: &str, reporter: &Reporter) -> Result<()> {
     if name.trim().is_empty() {
         bail!("project name cannot be empty");
     }
@@ -687,6 +717,7 @@ int main() {
 
     fs::write(root.join("cook.toml"), cook_toml)?;
     fs::write(root.join("src/main.cpp"), main_cpp)?;
+    reporter.success(format!("Project '{name}' created"));
 
     Ok(())
 }
@@ -765,7 +796,7 @@ fn cmake_defines_for_dependency(dep: &ResolvedDependency) -> BTreeMap<String, St
     defines
 }
 
-fn materialize_archive_dependency(name: &str, source_url: &str) -> Result<String> {
+fn materialize_archive_dependency(name: &str, source_url: &str, reporter: &Reporter) -> Result<String> {
     if !looks_like_archive_url(source_url) {
         bail!(
             "dependency source '{}' is not a direct '.git' URL and does not look like a downloadable '.zip' URL",
@@ -773,7 +804,7 @@ fn materialize_archive_dependency(name: &str, source_url: &str) -> Result<String
         );
     }
 
-    let bytes = download_archive_bytes(source_url)?;
+    let bytes = download_archive_bytes(source_url, reporter)?;
     let destination = Path::new(".cook").join("deps").join(name);
     if destination.exists() {
         fs::remove_dir_all(&destination)
@@ -782,19 +813,19 @@ fn materialize_archive_dependency(name: &str, source_url: &str) -> Result<String
     fs::create_dir_all(&destination)
         .with_context(|| format!("failed to create dependency directory {}", destination.display()))?;
 
-    extract_zip_archive(&bytes, &destination)
+    extract_zip_archive(&bytes, &destination, reporter)
         .with_context(|| format!("failed to extract archive '{}'", source_url))?;
 
     Ok(normalize_path(&destination))
 }
 
-fn download_archive_bytes(source_url: &str) -> Result<Vec<u8>> {
+fn download_archive_bytes(source_url: &str, reporter: &Reporter) -> Result<Vec<u8>> {
     let client = Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
         .context("failed to initialize HTTP client for archive download")?;
 
-    let response = client
+    let mut response = client
         .get(source_url)
         .header("User-Agent", "cook/0.1")
         .send()
@@ -812,15 +843,41 @@ fn download_archive_bytes(source_url: &str) -> Result<Vec<u8>> {
         );
     }
 
-    response
-        .bytes()
-        .map(|bytes| bytes.to_vec())
-        .with_context(|| format!("failed to read dependency archive body {}", source_url))
+    let total = response.content_length();
+    let progress = reporter.progress_bytes(total, format!("Downloading dependency archive from {source_url}"));
+    let mut bytes = Vec::with_capacity(
+        total
+            .map(|value| value.min(usize::MAX as u64) as usize)
+            .unwrap_or_default(),
+    );
+    let mut buffer = [0u8; 16 * 1024];
+
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .with_context(|| format!("failed while reading dependency archive body {}", source_url))?;
+        if read == 0 {
+            break;
+        }
+
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(pb) = &progress {
+            pb.inc(read as u64);
+        }
+    }
+
+    if let Some(pb) = progress {
+        pb.finish_with_message("Dependency archive download complete");
+    }
+
+    Ok(bytes)
 }
 
-fn extract_zip_archive(bytes: &[u8], destination: &Path) -> Result<()> {
+fn extract_zip_archive(bytes: &[u8], destination: &Path, reporter: &Reporter) -> Result<()> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .context("invalid zip archive format")?;
+
+    let progress = reporter.progress_items(archive.len() as u64, "Extracting dependency archive...");
 
     let strip_components = detect_common_top_level_component(&mut archive)?;
 
@@ -830,6 +887,9 @@ fn extract_zip_archive(bytes: &[u8], destination: &Path) -> Result<()> {
             .with_context(|| format!("failed to access archive entry {idx}"))?;
 
         let Some(enclosed_name) = entry.enclosed_name() else {
+            if let Some(pb) = &progress {
+                pb.inc(1);
+            }
             continue;
         };
 
@@ -842,6 +902,9 @@ fn extract_zip_archive(bytes: &[u8], destination: &Path) -> Result<()> {
             });
 
         if relative_path.as_os_str().is_empty() {
+            if let Some(pb) = &progress {
+                pb.inc(1);
+            }
             continue;
         }
 
@@ -850,6 +913,9 @@ fn extract_zip_archive(bytes: &[u8], destination: &Path) -> Result<()> {
         if entry.is_dir() {
             fs::create_dir_all(&output_path)
                 .with_context(|| format!("failed to create directory {}", output_path.display()))?;
+            if let Some(pb) = &progress {
+                pb.inc(1);
+            }
             continue;
         }
 
@@ -862,6 +928,14 @@ fn extract_zip_archive(bytes: &[u8], destination: &Path) -> Result<()> {
             .with_context(|| format!("failed to create file {}", output_path.display()))?;
         copy(&mut entry, &mut output_file)
             .with_context(|| format!("failed to write file {}", output_path.display()))?;
+
+        if let Some(pb) = &progress {
+            pb.inc(1);
+        }
+    }
+
+    if let Some(pb) = progress {
+        pb.finish_with_message("Dependency archive extraction complete");
     }
 
     Ok(())
