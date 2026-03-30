@@ -1,0 +1,25 @@
+# cook - toy C/C++ package manager(?)
+
+cook is a simple c/c++ package manager that can build and manage dependencies for C/C++ projects.
+it works above a true build system (currently cmake is supported) and provides a simple interface to manage dependencies and build projects.
+
+its VERY inspired by rust's [cargo](https://github.com/rust-lang/cargo)
+
+## example
+
+```bash
+# create a new project
+cook new my_project
+
+# add a dependency
+cd my_project
+cook add raylib
+
+# build the project
+cook build
+# release build
+cook build -r
+
+# run the project
+cook run
+```
