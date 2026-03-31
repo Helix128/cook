@@ -1,4 +1,4 @@
-use crate::config::BuildCompiler;
+use crate::config::{BuildCompileParams, BuildCompiler, OptimizationLevel};
 use crate::resolver::ResolvedDependency;
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
@@ -31,6 +31,8 @@ pub struct BuildPlan {
     pub cpp_standard: String,
     pub compiler: BuildCompiler,
     pub profile: BuildProfile,
+    pub build_threads: usize,
+    pub compile_params: BuildCompileParams,
     pub target_dir: String,
     pub sources: Vec<String>,
     pub dependencies: Vec<ResolvedDependency>,
@@ -154,6 +156,9 @@ impl BuildBackend for CmakeBackend {
             )
         };
 
+        let (cmake_c_flags, cmake_cxx_flags) = cmake_compile_flags(plan);
+        let compile_flag_lines = render_cmake_compile_flag_lines(&cmake_c_flags, &cmake_cxx_flags);
+
         let profile_output_dir = normalize_path(&absolute_path(&plan.profile_target_dir()));
 
         Ok(format!(
@@ -169,6 +174,8 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG "{}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE "{}")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "{}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "{}")
+
+{}
 
 {}
 
@@ -188,6 +195,7 @@ add_executable({}
             profile_output_dir,
             profile_output_dir,
             profile_output_dir,
+            compile_flag_lines,
             add_subdirectory,
             plan.project_name,
             source_block,
@@ -224,6 +232,8 @@ add_executable({}
                 build_dir,
                 "--config".to_string(),
                 config,
+                "--parallel".to_string(),
+                plan.build_threads.max(1).to_string(),
             ],
         }]
     }
@@ -295,16 +305,7 @@ impl BuildBackend for MakeBackend {
             .collect::<Vec<_>>()
             .join(" ");
 
-        let (c_flags, cxx_flags) = match plan.profile {
-            BuildProfile::Debug => (
-                "-O0 -g -Wall".to_string(),
-                format!("-O0 -g -Wall -std=c++{}", plan.cpp_standard),
-            ),
-            BuildProfile::Release => (
-                "-O3 -DNDEBUG -Wall".to_string(),
-                format!("-O3 -DNDEBUG -Wall -std=c++{}", plan.cpp_standard),
-            ),
-        };
+        let (c_flags, cxx_flags) = make_profile_flags(plan);
 
         Ok(format!(
             r#"CC ?= gcc
@@ -357,6 +358,7 @@ clean:
             args: vec![
                 "-f".to_string(),
                 normalize_path(&plan.profile_target_dir().join("Makefile")),
+                format!("-j{}", plan.build_threads.max(1)),
                 "all".to_string(),
             ],
         }]
@@ -421,6 +423,117 @@ fn cmake_toolchain_args(compiler: BuildCompiler) -> Vec<String> {
             }
         }
     }
+}
+
+fn cmake_compile_flags(plan: &BuildPlan) -> (String, String) {
+    let mut common_flags = Vec::<String>::new();
+    if let Some(level) = plan.compile_params.optimization {
+        common_flags.push(compiler_optimization_flag(plan.compiler, level).to_string());
+    }
+    if plan.compile_params.fast_math {
+        if let Some(flag) = compiler_fast_math_flag(plan.compiler) {
+            common_flags.push(flag.to_string());
+        }
+    }
+
+    let mut c_flags = common_flags.clone();
+    c_flags.extend(plan.compile_params.c_flags.clone());
+
+    let mut cxx_flags = common_flags;
+    cxx_flags.extend(plan.compile_params.cxx_flags.clone());
+
+    (c_flags.join(" "), cxx_flags.join(" "))
+}
+
+fn render_cmake_compile_flag_lines(c_flags: &str, cxx_flags: &str) -> String {
+    let mut lines = Vec::<String>::new();
+
+    if !c_flags.is_empty() {
+        lines.push(format!(
+            "set(CMAKE_C_FLAGS \"${{CMAKE_C_FLAGS}} {}\")",
+            cmake_escape(c_flags)
+        ));
+    }
+
+    if !cxx_flags.is_empty() {
+        lines.push(format!(
+            "set(CMAKE_CXX_FLAGS \"${{CMAKE_CXX_FLAGS}} {}\")",
+            cmake_escape(cxx_flags)
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn make_profile_flags(plan: &BuildPlan) -> (String, String) {
+    let optimization = plan
+        .compile_params
+        .optimization
+        .map(gnu_optimization_flag)
+        .unwrap_or_else(|| default_gnu_optimization_flag(plan.profile));
+
+    let mut c_flags = vec![optimization.to_string()];
+    if matches!(plan.profile, BuildProfile::Debug) {
+        c_flags.push("-g".to_string());
+    } else {
+        c_flags.push("-DNDEBUG".to_string());
+    }
+    c_flags.push("-Wall".to_string());
+
+    if plan.compile_params.fast_math {
+        c_flags.push("-ffast-math".to_string());
+    }
+
+    c_flags.extend(plan.compile_params.c_flags.clone());
+
+    let mut cxx_flags = c_flags.clone();
+    cxx_flags.push(format!("-std=c++{}", plan.cpp_standard));
+    cxx_flags.extend(plan.compile_params.cxx_flags.clone());
+
+    (c_flags.join(" "), cxx_flags.join(" "))
+}
+
+fn default_gnu_optimization_flag(profile: BuildProfile) -> &'static str {
+    match profile {
+        BuildProfile::Debug => "-O0",
+        BuildProfile::Release => "-O3",
+    }
+}
+
+fn gnu_optimization_flag(level: OptimizationLevel) -> &'static str {
+    match level {
+        OptimizationLevel::O0 => "-O0",
+        OptimizationLevel::O1 => "-O1",
+        OptimizationLevel::O2 => "-O2",
+        OptimizationLevel::O3 => "-O3",
+        OptimizationLevel::Os => "-Os",
+        OptimizationLevel::Oz => "-Oz",
+    }
+}
+
+fn compiler_optimization_flag(compiler: BuildCompiler, level: OptimizationLevel) -> &'static str {
+    match compiler {
+        BuildCompiler::Gcc => gnu_optimization_flag(level),
+        BuildCompiler::Msvc => match level {
+            OptimizationLevel::O0 => "/Od",
+            OptimizationLevel::O1 => "/O1",
+            OptimizationLevel::O2 => "/O2",
+            OptimizationLevel::O3 => "/Ox",
+            OptimizationLevel::Os => "/O1",
+            OptimizationLevel::Oz => "/O1",
+        },
+    }
+}
+
+fn compiler_fast_math_flag(compiler: BuildCompiler) -> Option<&'static str> {
+    match compiler {
+        BuildCompiler::Gcc => Some("-ffast-math"),
+        BuildCompiler::Msvc => Some("/fp:fast"),
+    }
+}
+
+fn cmake_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn compiler_id(compiler: BuildCompiler) -> &'static str {

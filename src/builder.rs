@@ -1,6 +1,6 @@
 use crate::cache;
 use crate::config::BuildBackend as BuildBackendKind;
-use crate::config::{BuildCompiler, CookConfig, DependencyDetail, DependencySpec};
+use crate::config::{BuildCompiler, BuildCompileParams, CookConfig, DependencyDetail, DependencySpec};
 use crate::backends::{BuildBackend, BuildPlan, BuildProfile, CmakeBackend, CommandSpec, MakeBackend};
 use crate::lockfile::CookLock;
 use crate::reporter::Reporter;
@@ -149,10 +149,13 @@ fn build_project_with_profile(profile: BuildProfile, reporter: &Reporter) -> Res
     enforce_lock_policy(&config, &lock, Path::new("cook.lock"))?;
 
     let mut resolved_dependencies = resolution.direct_dependencies;
+    let build_threads = config.build.threads.max(1);
+    let compile_params = compile_params_for_profile(&config, profile);
     prepare_external_dependencies(
         &mut resolved_dependencies,
         profile,
         config.build.compiler,
+        build_threads,
         reporter,
     )?;
 
@@ -166,6 +169,8 @@ fn build_project_with_profile(profile: BuildProfile, reporter: &Reporter) -> Res
         cpp_standard: config.project.cpp_standard.clone(),
         compiler: config.build.compiler,
         profile,
+        build_threads,
+        compile_params,
         target_dir: "target".to_string(),
         sources,
         dependencies: resolved_dependencies,
@@ -270,6 +275,7 @@ fn prepare_external_dependencies(
     dependencies: &mut [ResolvedDependency],
     profile: BuildProfile,
     compiler: BuildCompiler,
+    build_threads: usize,
     reporter: &Reporter,
 ) -> Result<()> {
     for dep in dependencies {
@@ -285,11 +291,17 @@ fn prepare_external_dependencies(
 
         let normalized_root = match build_system {
             ExternalBuildSystem::Cmake => {
-                let install_dir = build_external_cmake_dependency(dep, profile, compiler, reporter)?;
+                let install_dir = build_external_cmake_dependency(
+                    dep,
+                    profile,
+                    compiler,
+                    build_threads,
+                    reporter,
+                )?;
                 normalize_path(&install_dir)
             }
             ExternalBuildSystem::Make => {
-                let root_dir = build_external_make_dependency(dep, profile)?;
+                let root_dir = build_external_make_dependency(dep, profile, build_threads)?;
                 normalize_path(&root_dir)
             }
         };
@@ -523,6 +535,7 @@ fn build_external_cmake_dependency(
     dep: &ResolvedDependency,
     profile: BuildProfile,
     compiler: BuildCompiler,
+    build_threads: usize,
     reporter: &Reporter,
 ) -> Result<PathBuf> {
     let dep_root = PathBuf::from(&dep.root_dir);
@@ -565,6 +578,8 @@ fn build_external_cmake_dependency(
         normalize_path(&build_dir),
         "--config".to_string(),
         build_type.to_string(),
+        "--parallel".to_string(),
+        build_threads.max(1).to_string(),
     ];
     cmake_build_args.extend(dep.build.build_args.clone());
 
@@ -594,11 +609,16 @@ fn build_external_cmake_dependency(
     Ok(install_dir)
 }
 
-fn build_external_make_dependency(dep: &ResolvedDependency, profile: BuildProfile) -> Result<PathBuf> {
+fn build_external_make_dependency(
+    dep: &ResolvedDependency,
+    profile: BuildProfile,
+    build_threads: usize,
+) -> Result<PathBuf> {
     let dep_root = PathBuf::from(&dep.root_dir);
 
     let mut command = Command::new("make");
     command.arg("-C").arg(&dep_root);
+    command.arg(format!("-j{}", build_threads.max(1)));
     if matches!(profile, BuildProfile::Release) {
         command.env("CFLAGS", "-O3 -DNDEBUG");
         command.env("CXXFLAGS", "-O3 -DNDEBUG");
@@ -694,6 +714,19 @@ backend = "cmake"
 compiler = "gcc"
 strict_lock_in_ci = true
 offline = false
+# threads = 8
+
+[build.flags.debug]
+# optimization = "o0"
+# fast_math = false
+# c_flags = []
+# cxx_flags = []
+
+[build.flags.release]
+# optimization = "o3"
+# fast_math = false
+# c_flags = []
+# cxx_flags = []
 
 [resolver]
 write_lockfile = true
@@ -983,4 +1016,11 @@ fn looks_like_archive_url(source_url: &str) -> bool {
     let lower = source_url.trim().to_ascii_lowercase();
     lower.ends_with(".zip")
     || lower.contains(".zip?")
+}
+
+fn compile_params_for_profile(config: &CookConfig, profile: BuildProfile) -> BuildCompileParams {
+    match profile {
+        BuildProfile::Debug => config.build.flags.debug.clone(),
+        BuildProfile::Release => config.build.flags.release.clone(),
+    }
 }

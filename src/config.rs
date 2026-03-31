@@ -30,6 +30,10 @@ pub struct BuildConfig {
     pub strict_lock_in_ci: bool,
     #[serde(default)]
     pub offline: bool,
+    #[serde(default = "default_build_threads")]
+    pub threads: usize,
+    #[serde(default)]
+    pub flags: BuildProfileFlags,
 }
 
 impl Default for BuildConfig {
@@ -39,8 +43,41 @@ impl Default for BuildConfig {
             compiler: BuildCompiler::Gcc,
             strict_lock_in_ci: true,
             offline: false,
+            threads: default_build_threads(),
+            flags: BuildProfileFlags::default(),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct BuildProfileFlags {
+    #[serde(default)]
+    pub debug: BuildCompileParams,
+    #[serde(default)]
+    pub release: BuildCompileParams,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct BuildCompileParams {
+    #[serde(default)]
+    pub optimization: Option<OptimizationLevel>,
+    #[serde(default)]
+    pub fast_math: bool,
+    #[serde(default)]
+    pub c_flags: Vec<String>,
+    #[serde(default)]
+    pub cxx_flags: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OptimizationLevel {
+    O0,
+    O1,
+    O2,
+    O3,
+    Os,
+    Oz,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -234,4 +271,10 @@ fn visibility_from_bool(is_public: bool) -> DependencyVisibility {
 
 const fn default_true() -> bool {
     true
+}
+
+fn default_build_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
