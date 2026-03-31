@@ -124,6 +124,8 @@ pub struct DependencyDetail {
     pub rev: Option<String>,
     pub branch: Option<String>,
     pub tag: Option<String>,
+    pub source_sha256: Option<String>,
+    pub strip_prefix: Option<String>,
     pub registry_name: Option<String>,
     pub registry_version: Option<String>,
     pub build_system: Option<DependencyBuildSystem>,

@@ -34,6 +34,8 @@ enum Commands {
         name: String,
         #[arg(required = false)]
         url: Option<String>,
+        #[arg(long = "version", short = 'V', required = false)]
+        version: Option<String>,
     },
     Run,
 }
@@ -64,8 +66,13 @@ fn main() {
                 reporter.error(e.to_string());
             }
         }
-        Some(Commands::Add { name, url }) => {
-            if let Err(e) = builder::add_dependency(&name, url.as_deref(), &reporter) {
+        Some(Commands::Add { name, url, version }) => {
+            if let Err(e) = builder::add_dependency(
+                &name,
+                url.as_deref(),
+                version.as_deref(),
+                &reporter,
+            ) {
                 reporter.error(e.to_string());
             }
         }

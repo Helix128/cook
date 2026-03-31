@@ -10,6 +10,7 @@ use crate::scanner;
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
@@ -37,7 +38,12 @@ pub fn run_project(release: bool, reporter: &Reporter) -> Result<()> {
     Ok(())
 }
 
-pub fn add_dependency(name: &str, url: Option<&str>, reporter: &Reporter) -> Result<()> {
+pub fn add_dependency(
+    name: &str,
+    url: Option<&str>,
+    version_req: Option<&str>,
+    reporter: &Reporter,
+) -> Result<()> {
     if name.trim().is_empty() {
         bail!("dependency name cannot be empty");
     }
@@ -48,6 +54,10 @@ pub fn add_dependency(name: &str, url: Option<&str>, reporter: &Reporter) -> Res
     }
 
     let mut detail = if let Some(explicit_url) = url {
+        if version_req.is_some() {
+            bail!("--version cannot be used together with an explicit dependency URL");
+        }
+
         if explicit_url.trim().is_empty() {
             bail!("dependency source URL cannot be empty");
         }
@@ -58,7 +68,7 @@ pub fn add_dependency(name: &str, url: Option<&str>, reporter: &Reporter) -> Res
         }
     } else {
         let spinner = reporter.spinner(format!("Resolving '{name}' from cookbook..."));
-        let resolved = registry::resolve_package_from_cookbook(name);
+        let resolved = registry::resolve_package_from_cookbook(name, version_req);
         match (&spinner, &resolved) {
             (Some(pb), Ok(data)) => {
                 pb.finish_with_message(format!(
@@ -99,7 +109,13 @@ pub fn add_dependency(name: &str, url: Option<&str>, reporter: &Reporter) -> Res
         detail.rev = Some(rev.clone());
         format!("Dependency '{name}' added at pinned revision {rev}")
     } else {
-        let local_dep_path = materialize_archive_dependency(name, &source_url, reporter)?;
+        let local_dep_path = materialize_archive_dependency(
+            name,
+            &source_url,
+            detail.source_sha256.as_deref(),
+            detail.strip_prefix.as_deref(),
+            reporter,
+        )?;
         detail.path = Some(local_dep_path);
         detail.git = None;
         detail.rev = None;
@@ -829,7 +845,13 @@ fn cmake_defines_for_dependency(dep: &ResolvedDependency) -> BTreeMap<String, St
     defines
 }
 
-fn materialize_archive_dependency(name: &str, source_url: &str, reporter: &Reporter) -> Result<String> {
+fn materialize_archive_dependency(
+    name: &str,
+    source_url: &str,
+    expected_sha256: Option<&str>,
+    strip_prefix: Option<&str>,
+    reporter: &Reporter,
+) -> Result<String> {
     if !looks_like_archive_url(source_url) {
         bail!(
             "dependency source '{}' is not a direct '.git' URL and does not look like a downloadable '.zip' URL",
@@ -838,6 +860,10 @@ fn materialize_archive_dependency(name: &str, source_url: &str, reporter: &Repor
     }
 
     let bytes = download_archive_bytes(source_url, reporter)?;
+    if let Some(expected) = expected_sha256 {
+        verify_archive_sha256(&bytes, expected)?;
+    }
+
     let destination = Path::new(".cook").join("deps").join(name);
     if destination.exists() {
         fs::remove_dir_all(&destination)
@@ -846,7 +872,7 @@ fn materialize_archive_dependency(name: &str, source_url: &str, reporter: &Repor
     fs::create_dir_all(&destination)
         .with_context(|| format!("failed to create dependency directory {}", destination.display()))?;
 
-    extract_zip_archive(&bytes, &destination, reporter)
+    extract_zip_archive(&bytes, &destination, strip_prefix, reporter)
         .with_context(|| format!("failed to extract archive '{}'", source_url))?;
 
     Ok(normalize_path(&destination))
@@ -906,13 +932,48 @@ fn download_archive_bytes(source_url: &str, reporter: &Reporter) -> Result<Vec<u
     Ok(bytes)
 }
 
-fn extract_zip_archive(bytes: &[u8], destination: &Path, reporter: &Reporter) -> Result<()> {
+fn verify_archive_sha256(bytes: &[u8], expected_sha256: &str) -> Result<()> {
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    if expected.len() < 8 || !expected.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!(
+            "archive checksum '{}' is invalid; expected a hex sha256 string",
+            expected_sha256
+        );
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual = format!("{:x}", hasher.finalize());
+
+    if !actual.starts_with(&expected) {
+        bail!(
+            "archive checksum mismatch: expected '{}' but got '{}'",
+            expected,
+            actual
+        );
+    }
+
+    Ok(())
+}
+
+fn extract_zip_archive(
+    bytes: &[u8],
+    destination: &Path,
+    strip_prefix: Option<&str>,
+    reporter: &Reporter,
+) -> Result<()> {
     let mut archive = ZipArchive::new(Cursor::new(bytes))
         .context("invalid zip archive format")?;
 
     let progress = reporter.progress_items(archive.len() as u64, "Extracting dependency archive...");
 
-    let strip_components = detect_common_top_level_component(&mut archive)?;
+    let explicit_strip_prefix = strip_prefix
+        .map(|value| detect_explicit_strip_prefix(&mut archive, value))
+        .transpose()?;
+    let strip_components = explicit_strip_prefix
+        .as_ref()
+        .map(|prefix| prefix.len())
+        .unwrap_or(detect_common_top_level_component(&mut archive)?);
 
     for idx in 0..archive.len() {
         let mut entry = archive
@@ -925,6 +986,15 @@ fn extract_zip_archive(bytes: &[u8], destination: &Path, reporter: &Reporter) ->
             }
             continue;
         };
+
+        if let Some(prefix_components) = &explicit_strip_prefix
+            && !entry_matches_strip_prefix(&enclosed_name, prefix_components)
+        {
+            if let Some(pb) = &progress {
+                pb.inc(1);
+            }
+            continue;
+        }
 
         let relative_path = enclosed_name
             .components()
@@ -972,6 +1042,56 @@ fn extract_zip_archive(bytes: &[u8], destination: &Path, reporter: &Reporter) ->
     }
 
     Ok(())
+}
+
+fn detect_explicit_strip_prefix(
+    archive: &mut ZipArchive<Cursor<&[u8]>>,
+    strip_prefix: &str,
+) -> Result<Vec<String>> {
+    let normalized_components = strip_prefix
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| segment.to_string())
+        .collect::<Vec<_>>();
+
+    if normalized_components.is_empty() {
+        bail!("strip_prefix cannot be empty");
+    }
+
+    let has_match = (0..archive.len()).any(|idx| {
+        archive
+            .by_index(idx)
+            .ok()
+            .and_then(|entry| entry.enclosed_name())
+            .map(|path| entry_matches_strip_prefix(&path, &normalized_components))
+            .unwrap_or(false)
+    });
+
+    if !has_match {
+        bail!(
+            "strip_prefix '{}' was not found in archive entries",
+            strip_prefix
+        );
+    }
+
+    Ok(normalized_components)
+}
+
+fn entry_matches_strip_prefix(path: &Path, components: &[String]) -> bool {
+    let path_components = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+
+    if path_components.len() < components.len() {
+        return false;
+    }
+
+    components
+        .iter()
+        .zip(path_components.iter())
+        .all(|(left, right)| left == right)
 }
 
 fn detect_common_top_level_component(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Result<usize> {
